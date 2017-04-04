@@ -16,6 +16,7 @@
 
 package org.jetbrains.kotlin.backend.common
 
+import org.jetbrains.kotlin.backend.common.lower.SimpleMemberScope
 import org.jetbrains.kotlin.backend.konan.Context
 import org.jetbrains.kotlin.descriptors.*
 import org.jetbrains.kotlin.descriptors.impl.ClassConstructorDescriptorImpl
@@ -76,6 +77,7 @@ internal class DeepCopyIrTreeWithDescriptors(val targetFunction: IrFunction, val
             val oldDescriptor = declaration.descriptor
             val newDescriptor = copyClassDescriptor(oldDescriptor)
             descriptorSubstituteMap[oldDescriptor] = newDescriptor
+            descriptorSubstituteMap[oldDescriptor.thisAsReceiverParameter] = newDescriptor.thisAsReceiverParameter
             super.visitClass(declaration)
 
             val constructors = oldDescriptor.constructors.map {
@@ -88,10 +90,17 @@ internal class DeepCopyIrTreeWithDescriptors(val targetFunction: IrFunction, val
                 primaryConstructor = descriptorSubstituteMap[oldPrimaryConstructor] as ClassConstructorDescriptor
             }
 
+            val contributedDescriptors = oldDescriptor.unsubstitutedMemberScope
+                    .getContributedDescriptors()
+                    .map {
+                        if (it is CallableMemberDescriptor && it.kind == CallableMemberDescriptor.Kind.FAKE_OVERRIDE)
+                            it
+                        else descriptorSubstituteMap[it]!!
+                    }
             newDescriptor.initialize(
-                oldDescriptor.unsubstitutedMemberScope,
-                constructors,
-                primaryConstructor
+                    SimpleMemberScope(contributedDescriptors),
+                    constructors,
+                    primaryConstructor
             )
         }
 
@@ -141,7 +150,8 @@ internal class DeepCopyIrTreeWithDescriptors(val targetFunction: IrFunction, val
 
         private fun copySimpleFunctionDescriptor(oldDescriptor: SimpleFunctionDescriptor) : FunctionDescriptor {
 
-            val memberOwner = targetFunction.descriptor
+            val oldContainingDeclaration = oldDescriptor.containingDeclaration
+            val memberOwner = descriptorSubstituteMap[oldContainingDeclaration] ?: targetFunction.descriptor
             val newDescriptor = SimpleFunctionDescriptorImpl.create(
                 memberOwner,
                 oldDescriptor.annotations,
@@ -150,19 +160,23 @@ internal class DeepCopyIrTreeWithDescriptors(val targetFunction: IrFunction, val
                 oldDescriptor.source
             ).apply { isTailrec = oldDescriptor.isTailrec }
 
-            val newDispatchReceiverParameter = null                                         // TODO
+            val oldDispatchReceiverParameter = oldDescriptor.dispatchReceiverParameter
+            val newDispatchReceiverParameter =
+                    if (oldDispatchReceiverParameter == null) null
+                    else descriptorSubstituteMap[oldDispatchReceiverParameter]
             val newTypeParameters = oldDescriptor.typeParameters
-            val newValueParameters = copyValueParameters(oldDescriptor.valueParameters, memberOwner)
+            val newValueParameters = copyValueParameters(oldDescriptor.valueParameters, newDescriptor)
 
             newDescriptor.initialize(
                 oldDescriptor.extensionReceiverParameter?.type,
-                newDispatchReceiverParameter,
+                newDispatchReceiverParameter as? ReceiverParameterDescriptor,
                 newTypeParameters,
                 newValueParameters,
                 oldDescriptor.returnType,
                 Modality.FINAL,
-                Visibilities.LOCAL
+                oldDescriptor.visibility
             )
+            newDescriptor.overriddenDescriptors += oldDescriptor.overriddenDescriptors
             return newDescriptor
         }
 
@@ -257,7 +271,7 @@ internal class DeepCopyIrTreeWithDescriptors(val targetFunction: IrFunction, val
             if (irCall !is IrCallImpl) return irCall                                        // TODO what other kinds of call can we meet?
 
             val oldDescriptor = irCall.descriptor
-            val newDescriptor = descriptorSubstituteMap.getOrDefault(oldDescriptor,
+            val newDescriptor = descriptorSubstituteMap.getOrDefault(oldDescriptor.original,
                 oldDescriptor) as FunctionDescriptor
 
             val oldSuperQualifier = irCall.superQualifier

@@ -36,6 +36,7 @@ import org.jetbrains.kotlin.types.KotlinType
 import org.jetbrains.kotlin.types.TypeProjectionImpl
 import org.jetbrains.kotlin.types.TypeSubstitutor
 import org.jetbrains.kotlin.types.Variance
+import org.jetbrains.kotlin.resolve.descriptorUtil.hasDefaultValue
 import org.jetbrains.kotlin.types.typeUtil.makeNullable
 
 //-----------------------------------------------------------------------------//
@@ -84,9 +85,6 @@ internal class FunctionInlining(val context: Context): IrElementTransformerVoid(
 
     override fun visitCall(expression: IrCall): IrExpression {
 
-        val fqName = currentFile!!.packageFragmentDescriptor.fqName.asString()              // TODO to be removed after stdlib compilation
-        if(fqName.contains("kotlin")) return super.visitCall(expression)                    // TODO to be removed after stdlib compilation
-
         val irCall = super.visitCall(expression) as IrCall
 
         val functionDescriptor = irCall.descriptor as FunctionDescriptor
@@ -108,8 +106,6 @@ internal class FunctionInlining(val context: Context): IrElementTransformerVoid(
     private fun needsEvaluation(expression: IrExpression): Boolean {
         if (expression is IrGetValue)          return false                                 // Parameter is already GetValue - nothing to evaluate.
         if (expression is IrConst<*>)          return false                                 // Parameter is constant - nothing to evaluate.
-        if (expression is IrCallableReference) return false                                 // Parameter is CallableReference - nothing to evaluate.
-        if (expression is IrBlock)             return false                                 // Parameter is Block - nothing to evaluate.
         if (isLambdaExpression(expression))    return false                                 // Parameter is lambda - will be inlined.
         return true
     }
@@ -132,11 +128,17 @@ internal class FunctionInlining(val context: Context): IrElementTransformerVoid(
 
         descriptor.valueParameters.forEach { parameter ->
             val argument = irCall.getValueArgument(parameter.index)
-            if (argument != null) {
-                result += ArgumentWithValue(parameter, argument)
-            } else {
-                val defaultArgument = declaration.getDefault(parameter)!!.expression
-                result += ArgumentWithValue(parameter, defaultArgument)
+            when {
+                argument != null -> result += ArgumentWithValue(parameter, argument)
+                parameter.hasDefaultValue() -> {
+                    val defaultArgument = declaration.getDefault(parameter)!!.expression
+                    result += ArgumentWithValue(parameter, defaultArgument)
+                }
+                parameter.varargElementType != null -> {
+                    val emptyArray = IrVarargImpl(irCall.startOffset, irCall.endOffset, parameter.type, parameter.varargElementType!!)
+                    result += ArgumentWithValue(parameter, emptyArray)
+                }
+                else -> throw Error("Incomplete expression: call to $descriptor has no argument at index ${parameter.index}")
             }
         }
 
@@ -185,6 +187,7 @@ internal class FunctionInlining(val context: Context): IrElementTransformerVoid(
     //-------------------------------------------------------------------------//
 
     private fun createInlineFunctionBody(functionDeclaration: IrFunction): IrInlineFunctionBody? {
+        functionDeclaration.transformChildrenVoid(this)                                     // Inline recursively.
 
         val originBlockBody = functionDeclaration.body
         if (originBlockBody == null) return null                                            // TODO workaround
@@ -264,7 +267,8 @@ internal class FunctionInlining(val context: Context): IrElementTransformerVoid(
             val operandTypeDescriptor = newExpression.typeOperand.constructor.declarationDescriptor
             if (operandTypeDescriptor !is TypeParameterDescriptor) return newExpression        // It is not TypeParameter - do nothing
 
-            var typeNew         = typeArgsMap[operandTypeDescriptor]!!
+            var typeNew = typeArgsMap[operandTypeDescriptor]
+                    ?: return expression
             if (newExpression.typeOperand.isMarkedNullable)
                 typeNew = typeNew.makeNullable()
             val startOffset     = newExpression.startOffset
@@ -281,7 +285,7 @@ internal class FunctionInlining(val context: Context): IrElementTransformerVoid(
         override fun visitGetValue(expression: IrGetValue): IrExpression {
             val newExpression = super.visitGetValue(expression) as IrGetValue
             val descriptor = newExpression.descriptor
-            val argument = substituteMap[descriptor]                                      // Find expression to replace this parameter.
+            val argument = substituteMap[descriptor]?.accept(InlineCopyIr(), null) as IrExpression?  // Find expression to replace this parameter.
             if (argument == null) return newExpression                                    // If there is no such expression - do nothing
 
             return argument
@@ -364,9 +368,11 @@ internal class FunctionInlining(val context: Context): IrElementTransformerVoid(
             val typeSubstitutor = createTypeSubstitutor()
             val typeArguments   = substituteTypeArguments(irCall, typeSubstitutor)
             val returnType = typeSubstitutor.substitute(irCall.type, Variance.INVARIANT) ?: irCall.type
+            val descriptor = irCall.descriptor.substitute(typeSubstitutor)!!
+            val superQualifier = irCall.superQualifier?.substitute(typeSubstitutor)
 
-            return IrCallImpl(irCall.startOffset, irCall.endOffset, returnType, irCall.descriptor,
-                typeArguments, irCall.origin, irCall.superQualifier).apply {
+            return IrCallImpl(irCall.startOffset, irCall.endOffset, returnType, descriptor,
+                typeArguments, irCall.origin, superQualifier).apply {
                     irCall.descriptor.valueParameters.forEach {
                         val valueArgument = irCall.getValueArgument(it)
                         putValueArgument(it.index, valueArgument)
